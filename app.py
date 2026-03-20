@@ -28,7 +28,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 4.4rem;
+        padding-top: 5.2rem;
         padding-bottom: 3rem;
         max-width: 1450px;
     }
@@ -71,7 +71,7 @@ st.markdown(
 def normalize_text(value: object) -> str:
     if pd.isna(value):
         return ""
-    text = str(value).strip()
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
     return re.sub(r"\s+", " ", text)
 
 
@@ -79,25 +79,27 @@ def normalize_text(value: object) -> str:
 def parse_date_from_text(text: str) -> Optional[date]:
     if not text:
         return None
-    text = str(text)
+    text = str(text).strip()
     patterns = [
         r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})",
         r"(20\d{2})(\d{2})(\d{2})",
-        r"(\d{1,2})[-./](\d{1,2})",
+        r"(^|[^\d])(\d{1,2})[-./](\d{1,2})([^\d]|$)",
     ]
+    current_year = datetime.now().year
+    fallback_year = 2026 if current_year >= 2026 else current_year
+
     for pattern in patterns:
         match = re.search(pattern, text)
         if not match:
             continue
         groups = match.groups()
         try:
-            if len(groups) == 3 and len(groups[0]) == 4:
-                year, month, day = map(int, groups)
+            if len(groups) >= 3 and groups[0].isdigit() and len(groups[0]) == 4:
+                year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
                 return date(year, month, day)
-            if len(groups) == 2:
-                month, day = map(int, groups)
-                inferred_year = 2025 if datetime.now().year > 2025 else datetime.now().year
-                return date(inferred_year, month, day)
+            if len(groups) >= 4 and groups[1].isdigit() and groups[2].isdigit():
+                month, day = int(groups[1]), int(groups[2])
+                return date(fallback_year, month, day)
         except Exception:
             continue
     return None
@@ -107,7 +109,9 @@ def parse_date_from_text(text: str) -> Optional[date]:
 def safe_date_string(value: object) -> str:
     if value in (None, ""):
         return ""
-    if isinstance(value, (datetime, pd.Timestamp)):
+    if isinstance(value, pd.Timestamp):
+        return value.date().strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
     if isinstance(value, date):
         return value.strftime("%Y-%m-%d")
@@ -136,21 +140,24 @@ def read_excel_bytes(file_bytes: bytes, source_name: str) -> pd.DataFrame:
         return pd.DataFrame(columns=BASE_COLUMNS)
 
     return_date = extract_return_date(raw, source_name)
-    rows = []
-    for idx in range(2, len(raw)):
+    rows: list[dict[str, object]] = []
+
+    for idx in range(1, len(raw)):
         serial = normalize_text(raw.iat[idx, 0]) if raw.shape[1] > 0 else ""
         vendor = normalize_text(raw.iat[idx, 1]) if raw.shape[1] > 1 else ""
         address = normalize_text(raw.iat[idx, 2]) if raw.shape[1] > 2 else ""
         content = normalize_text(raw.iat[idx, 3]) if raw.shape[1] > 3 else ""
 
+        if vendor == "거래처명" and content == "내용":
+            continue
         if not any([serial, vendor, address, content]):
             continue
-        if vendor == "거래처명" and content == "내용":
+        if vendor == "":
             continue
 
         rows.append(
             {
-                "반납일": return_date,
+                "반납일": pd.to_datetime(return_date) if return_date else pd.NaT,
                 "반납일표기": safe_date_string(return_date),
                 "순번": serial,
                 "업체명": vendor,
@@ -170,13 +177,11 @@ def load_from_zip_bytes(file_bytes: bytes) -> list[pd.DataFrame]:
         for member in zf.infolist():
             if member.is_dir():
                 continue
-            lower_name = member.filename.lower()
-            if not lower_name.endswith((".xls", ".xlsx")):
+            member_name = Path(member.filename).name
+            if not member_name.lower().endswith((".xls", ".xlsx")):
                 continue
             try:
-                member_bytes = zf.read(member)
-                member_name = Path(member.filename).name
-                frame = read_excel_bytes(member_bytes, member_name)
+                frame = read_excel_bytes(zf.read(member), member_name)
                 if not frame.empty:
                     frames.append(frame)
             except Exception:
@@ -193,10 +198,18 @@ def empty_df() -> pd.DataFrame:
 def finalize_df(frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not frames:
         return empty_df()
+
     merged = pd.concat(frames, ignore_index=True)
+    merged["반납일"] = pd.to_datetime(merged["반납일"], errors="coerce")
+    merged = merged.dropna(subset=["반납일", "업체명"])
+    merged["업체명"] = merged["업체명"].fillna("").astype(str).str.strip()
+    merged["주소"] = merged["주소"].fillna("").astype(str).str.strip()
+    merged["상품내용"] = merged["상품내용"].fillna("").astype(str).str.strip()
+    merged["원본파일"] = merged["원본파일"].fillna("").astype(str).str.strip()
+    merged["반납일표기"] = merged["반납일"].dt.strftime("%Y-%m-%d")
     merged = merged.drop_duplicates(subset=["반납일표기", "업체명", "주소", "상품내용", "원본파일"])
-    merged["검색용_업체"] = merged["업체명"].fillna("").astype(str).str.lower()
-    merged["검색용_상품"] = merged["상품내용"].fillna("").astype(str).str.lower()
+    merged["검색용_업체"] = merged["업체명"].str.lower()
+    merged["검색용_상품"] = merged["상품내용"].str.lower()
     merged = merged.sort_values(by=["반납일", "업체명", "순번"], ascending=[False, True, True], kind="stable")
     return merged.reset_index(drop=True)
 
@@ -204,13 +217,18 @@ def finalize_df(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 def load_local_defaults() -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
+    loaded_names: set[str] = set()
     for path in DEFAULT_FILES:
         if not path.exists():
             continue
         try:
             if path.suffix.lower() == ".zip":
-                frames.extend(load_from_zip_bytes(path.read_bytes()))
-            else:
+                zip_frames = load_from_zip_bytes(path.read_bytes())
+                frames.extend(zip_frames)
+                loaded_names.update(f.iloc[0]["원본파일"] for f in zip_frames if not f.empty)
+            elif path.suffix.lower() in {".xls", ".xlsx"}:
+                if path.name in loaded_names:
+                    continue
                 frame = read_excel_bytes(path.read_bytes(), path.name)
                 if not frame.empty:
                     frames.append(frame)
@@ -285,27 +303,33 @@ def filter_df(
     filtered = df.copy()
     error_msg = None
 
+    if filtered.empty:
+        return filtered, error_msg
+
+    # 날짜 필터는 검색 방식에 따라 항상 먼저 적용
+    if mode == "하루 검색" and single_date:
+        day_ts = pd.Timestamp(single_date)
+        filtered = filtered[filtered["반납일"] == day_ts]
+    elif mode == "기간 검색":
+        start, end = range_dates
+        if start and end:
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+            filtered = filtered[(filtered["반납일"] >= start_ts) & (filtered["반납일"] <= end_ts)]
+    elif mode == "수기 입력(~)":
+        start, end, error_msg = parse_manual_date_range(manual_range_text)
+        if not error_msg and start and end:
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+            filtered = filtered[(filtered["반납일"] >= start_ts) & (filtered["반납일"] <= end_ts)]
+
     vendor_keyword = (vendor_keyword or "").strip().lower()
     product_keyword = (product_keyword or "").strip().lower()
-    keyword_only_search = bool(vendor_keyword or product_keyword)
 
-    if not filtered.empty:
-        if not keyword_only_search:
-            if mode == "하루 검색" and single_date:
-                filtered = filtered[filtered["반납일"] == single_date]
-            elif mode == "기간 검색":
-                start, end = range_dates
-                if start and end:
-                    filtered = filtered[(filtered["반납일"] >= start) & (filtered["반납일"] <= end)]
-            elif mode == "수기 입력(~)":
-                start, end, error_msg = parse_manual_date_range(manual_range_text)
-                if not error_msg and start and end:
-                    filtered = filtered[(filtered["반납일"] >= start) & (filtered["반납일"] <= end)]
-
-        if vendor_keyword:
-            filtered = filtered[filtered["검색용_업체"].str.contains(vendor_keyword, na=False)]
-        if product_keyword:
-            filtered = filtered[filtered["검색용_상품"].str.contains(product_keyword, na=False)]
+    if vendor_keyword:
+        filtered = filtered[filtered["검색용_업체"].str.contains(vendor_keyword, na=False)]
+    if product_keyword:
+        filtered = filtered[filtered["검색용_상품"].str.contains(product_keyword, na=False)]
 
     return filtered.reset_index(drop=True), error_msg
 
@@ -324,7 +348,6 @@ current_month_start = current_today.replace(day=1)
 st.markdown('<div class="top-actions"></div>', unsafe_allow_html=True)
 if st.button("새 작업 / 업로드 초기화"):
     st.session_state.uploader_nonce += 1
-    st.session_state.pop("search_clicked", None)
     st.rerun()
 
 base_df = get_default_dataset()
@@ -341,7 +364,7 @@ all_df = combine_datasets(base_df, uploaded_df)
 
 st.markdown('<div class="main-title">미샵 샘플 반품 관리 프로그램</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">거래처에서 샘플 반품 여부를 문의할 때, 등록된 반납 리스트에 해당 내역이 있는지 빠르게 확인하는 용도입니다.</div>',
+    '<div class="sub-title">등록된 샘플 반납 리스트에서 반품 내역이 있는지 빠르게 확인하는 용도입니다.</div>',
     unsafe_allow_html=True,
 )
 
@@ -354,10 +377,11 @@ search_mode = st.radio(
 
 with st.form("search_form"):
     col1, col2, col3, col4 = st.columns([1.35, 1, 1.15, 0.55])
+    single_date = None
+    range_dates = (None, None)
+    manual_range_text = ""
+
     with col1:
-        single_date = None
-        range_dates = (None, None)
-        manual_range_text = ""
         if search_mode == "기간 검색":
             picked = st.date_input(
                 "반납일 범위",
@@ -380,21 +404,24 @@ with st.form("search_form"):
         st.markdown("<div style='height: 1.8rem;'></div>", unsafe_allow_html=True)
         search_clicked = st.form_submit_button("검색", use_container_width=True)
 
-if search_clicked or "search_clicked" not in st.session_state:
-    st.session_state.search_clicked = True
-
-filtered_df, error_msg = filter_df(
-    all_df,
-    search_mode,
-    single_date,
-    range_dates if isinstance(range_dates, tuple) else tuple(range_dates),
-    manual_range_text,
-    vendor_keyword,
-    product_keyword,
-)
+if not search_clicked:
+    filtered_df = all_df.iloc[0:0].copy()
+    error_msg = None
+else:
+    filtered_df, error_msg = filter_df(
+        all_df,
+        search_mode,
+        single_date,
+        range_dates if isinstance(range_dates, tuple) else tuple(range_dates),
+        manual_range_text,
+        vendor_keyword,
+        product_keyword,
+    )
 
 st.markdown("### 검색 결과")
-if error_msg:
+if not search_clicked:
+    st.info("검색 조건을 입력한 뒤 검색 버튼을 눌러주세요.")
+elif error_msg:
     st.error(error_msg)
 elif filtered_df.empty:
     st.warning("등록된 샘플 반납 리스트에서 일치하는 내역이 없습니다.")
@@ -413,9 +440,9 @@ with st.expander("프로그램 안내", expanded=False):
         f"""
 - 처음 제공해주신 ZIP/XLS 파일 전체를 기본 등록 데이터로 포함했습니다.
 - 현재 기본 등록 데이터는 **{len(base_df):,}건**입니다.
-- 이후 새 XLS/XLSX/ZIP 파일을 수시로 업로드하면 기존 데이터와 합쳐서 바로 검색할 수 있습니다.
-- 기간 검색의 기본값은 **현재 월 1일 ~ 오늘**입니다.
-- 업체명 또는 상품명을 입력하면 **전체 등록 데이터 기준**으로 바로 검색됩니다.
+- ZIP 안의 엑셀 파일은 모두 읽어서 통합 검색합니다.
+- 기간 검색 기본값은 **현재 월 1일 ~ 오늘**입니다.
+- 날짜 조건과 업체명/상품명 조건은 **함께 적용**됩니다.
         """
     )
 
