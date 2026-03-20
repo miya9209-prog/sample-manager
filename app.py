@@ -28,22 +28,22 @@ st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 2.6rem;
+        padding-top: 4.4rem;
         padding-bottom: 3rem;
         max-width: 1450px;
     }
     .main-title {
         font-size: 2rem;
         font-weight: 800;
-        margin: 0.2rem 0 0.25rem 0;
+        margin: 0.45rem 0 0.3rem 0;
     }
     .sub-title {
         color: #555;
         font-size: 1rem;
-        margin-bottom: 1.1rem;
+        margin-bottom: 1.2rem;
     }
     .top-actions {
-        margin-bottom: 0.7rem;
+        margin-bottom: 0.9rem;
     }
     .footer-copy {
         margin-top: 28px;
@@ -55,6 +55,12 @@ st.markdown(
     }
     .bottom-guide {
         margin-top: 1rem;
+    }
+    div[data-testid="stForm"] {
+        border: 1px solid #ececec;
+        border-radius: 14px;
+        padding: 0.8rem 0.9rem 0.2rem 0.9rem;
+        background: #fff;
     }
     </style>
     """,
@@ -253,17 +259,17 @@ def parse_manual_date_range(text: str) -> tuple[Optional[date], Optional[date], 
     if len(parts) == 1:
         one_day = parse_date_from_text(parts[0])
         if one_day is None:
-            return None, None, "날짜 형식을 확인해주세요. 예: 2025-03-01~2025-03-20"
+            return None, None, "날짜 형식을 확인해주세요. 예: 2026-03-01~2026-03-20"
         return one_day, one_day, None
     if len(parts) == 2:
         start = parse_date_from_text(parts[0])
         end = parse_date_from_text(parts[1])
         if start is None or end is None:
-            return None, None, "날짜 형식을 확인해주세요. 예: 2025-03-01~2025-03-20"
+            return None, None, "날짜 형식을 확인해주세요. 예: 2026-03-01~2026-03-20"
         if start > end:
             start, end = end, start
         return start, end, None
-    return None, None, "날짜 형식을 확인해주세요. 예: 2025-03-01~2025-03-20"
+    return None, None, "날짜 형식을 확인해주세요. 예: 2026-03-01~2026-03-20"
 
 
 
@@ -279,20 +285,22 @@ def filter_df(
     filtered = df.copy()
     error_msg = None
 
-    if not filtered.empty:
-        if mode == "하루 검색" and single_date:
-            filtered = filtered[filtered["반납일"] == single_date]
-        elif mode == "기간 검색":
-            start, end = range_dates
-            if start and end:
-                filtered = filtered[(filtered["반납일"] >= start) & (filtered["반납일"] <= end)]
-        elif mode == "수기 입력(~)":
-            start, end, error_msg = parse_manual_date_range(manual_range_text)
-            if not error_msg and start and end:
-                filtered = filtered[(filtered["반납일"] >= start) & (filtered["반납일"] <= end)]
+    vendor_keyword = (vendor_keyword or "").strip().lower()
+    product_keyword = (product_keyword or "").strip().lower()
+    keyword_only_search = bool(vendor_keyword or product_keyword)
 
-        vendor_keyword = (vendor_keyword or "").strip().lower()
-        product_keyword = (product_keyword or "").strip().lower()
+    if not filtered.empty:
+        if not keyword_only_search:
+            if mode == "하루 검색" and single_date:
+                filtered = filtered[filtered["반납일"] == single_date]
+            elif mode == "기간 검색":
+                start, end = range_dates
+                if start and end:
+                    filtered = filtered[(filtered["반납일"] >= start) & (filtered["반납일"] <= end)]
+            elif mode == "수기 입력(~)":
+                start, end, error_msg = parse_manual_date_range(manual_range_text)
+                if not error_msg and start and end:
+                    filtered = filtered[(filtered["반납일"] >= start) & (filtered["반납일"] <= end)]
 
         if vendor_keyword:
             filtered = filtered[filtered["검색용_업체"].str.contains(vendor_keyword, na=False)]
@@ -310,9 +318,13 @@ def get_default_dataset() -> pd.DataFrame:
 if "uploader_nonce" not in st.session_state:
     st.session_state.uploader_nonce = 0
 
+current_today = date.today()
+current_month_start = current_today.replace(day=1)
+
 st.markdown('<div class="top-actions"></div>', unsafe_allow_html=True)
 if st.button("새 작업 / 업로드 초기화"):
     st.session_state.uploader_nonce += 1
+    st.session_state.pop("search_clicked", None)
     st.rerun()
 
 base_df = get_default_dataset()
@@ -337,28 +349,39 @@ search_mode = st.radio(
     "반납일 검색 방식",
     ["기간 검색", "하루 검색", "수기 입력(~)", "전체"],
     horizontal=True,
+    index=0,
 )
 
-min_date = all_df["반납일"].dropna().min() if not all_df.empty and all_df["반납일"].notna().any() else date.today()
-max_date = all_df["반납일"].dropna().max() if not all_df.empty and all_df["반납일"].notna().any() else date.today()
+with st.form("search_form"):
+    col1, col2, col3, col4 = st.columns([1.35, 1, 1.15, 0.55])
+    with col1:
+        single_date = None
+        range_dates = (None, None)
+        manual_range_text = ""
+        if search_mode == "기간 검색":
+            picked = st.date_input(
+                "반납일 범위",
+                value=(current_month_start, current_today),
+                format="YYYY-MM-DD",
+            )
+            if isinstance(picked, tuple) and len(picked) == 2:
+                range_dates = picked
+        elif search_mode == "하루 검색":
+            single_date = st.date_input("반납일", value=current_today, format="YYYY-MM-DD")
+        elif search_mode == "수기 입력(~)":
+            manual_range_text = st.text_input("반납일 수기 입력", placeholder="예: 2026-03-01~2026-03-20")
+        else:
+            st.text_input("반납일", value="전체", disabled=True)
+    with col2:
+        vendor_keyword = st.text_input("업체명", placeholder="예: 까르르")
+    with col3:
+        product_keyword = st.text_input("상품명 / 내용", placeholder="예: 맨투맨, 코트, 슬랙스")
+    with col4:
+        st.markdown("<div style='height: 1.8rem;'></div>", unsafe_allow_html=True)
+        search_clicked = st.form_submit_button("검색", use_container_width=True)
 
-col1, col2, col3 = st.columns([1.2, 1, 1.4])
-with col1:
-    single_date = None
-    range_dates = (None, None)
-    manual_range_text = ""
-    if search_mode == "기간 검색":
-        picked = st.date_input("반납일 범위", value=(min_date, max_date), format="YYYY-MM-DD")
-        if isinstance(picked, tuple) and len(picked) == 2:
-            range_dates = picked
-    elif search_mode == "하루 검색":
-        single_date = st.date_input("반납일", value=max_date, format="YYYY-MM-DD")
-    elif search_mode == "수기 입력(~)":
-        manual_range_text = st.text_input("반납일 수기 입력", placeholder="예: 2025-03-01~2025-03-20")
-with col2:
-    vendor_keyword = st.text_input("업체명", placeholder="예: 까르르")
-with col3:
-    product_keyword = st.text_input("상품명 / 내용", placeholder="예: 맨투맨, 코트, 슬랙스")
+if search_clicked or "search_clicked" not in st.session_state:
+    st.session_state.search_clicked = True
 
 filtered_df, error_msg = filter_df(
     all_df,
@@ -376,7 +399,6 @@ if error_msg:
 elif filtered_df.empty:
     st.warning("등록된 샘플 반납 리스트에서 일치하는 내역이 없습니다.")
 else:
-    st.success(f"등록된 샘플 반납 리스트에서 {len(filtered_df):,}건 확인되었습니다.")
     display_df = filtered_df[["반납일표기", "업체명", "주소", "상품내용", "원본파일"]].rename(
         columns={
             "반납일표기": "반납일",
@@ -384,14 +406,16 @@ else:
         }
     )
     st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.caption(f"검색 결과 {len(display_df):,}건")
 
 with st.expander("프로그램 안내", expanded=False):
     st.markdown(
         f"""
-- 처음 제공해주신 ZIP/XLS 파일을 기본 등록 데이터로 포함했습니다.
+- 처음 제공해주신 ZIP/XLS 파일 전체를 기본 등록 데이터로 포함했습니다.
 - 현재 기본 등록 데이터는 **{len(base_df):,}건**입니다.
 - 이후 새 XLS/XLSX/ZIP 파일을 수시로 업로드하면 기존 데이터와 합쳐서 바로 검색할 수 있습니다.
-- 이 프로그램의 기준은 **등록된 반납 리스트에 있는지 없는지 확인**하는 것입니다.
+- 기간 검색의 기본값은 **현재 월 1일 ~ 오늘**입니다.
+- 업체명 또는 상품명을 입력하면 **전체 등록 데이터 기준**으로 바로 검색됩니다.
         """
     )
 
