@@ -93,16 +93,15 @@ def extract_date(raw: pd.DataFrame, source_name: str):
             except Exception:
                 pass
 
-    # 3) 03-05.xls 형태는 현재 연도 기준으로 추정
+    # 3) 03-05.xls / 05-12.xls처럼 파일명에 연도가 없는 기존 자료는 2025년 데이터로 고정 처리
+    #    형준님 기준: 연도 없는 샘플반납 파일은 2025년 자료입니다.
     m2 = re.search(r"(?<!\d)(\d{1,2})[-./](\d{1,2})(?!\d)", base)
     if m2:
         mth, d = map(int, m2.groups())
-        today = date.today()
-        for year in [today.year, today.year - 1, today.year + 1]:
-            try:
-                return pd.Timestamp(year, mth, d)
-            except Exception:
-                continue
+        try:
+            return pd.Timestamp(2025, mth, d)
+        except Exception:
+            pass
     return pd.NaT
 
 
@@ -289,6 +288,54 @@ def get_file_already_imported(file_hash: str) -> bool:
         return cur.fetchone() is not None
 
 
+def infer_2025_date_from_no_year_filename(filename: str):
+    """기존 파일명(예: 05-12.xls, 12-08..xls, 01-09-standalone.xls)에 연도가 없으면 2025년으로 보정."""
+    base = os.path.basename(filename or "")
+    # 2026-03-05.xls 처럼 연도가 명시된 파일은 건드리지 않음
+    if re.search(r"20\d{2}", base):
+        return None
+    m = re.search(r"(?<!\d)(\d{1,2})[-./](\d{1,2})(?!\d)", base)
+    if not m:
+        return None
+    month, day = map(int, m.groups())
+    try:
+        return f"2025-{month:02d}-{day:02d}"
+    except Exception:
+        return None
+
+
+def migrate_no_year_files_to_2025():
+    """이전 버전에서 연도 없는 파일을 2026년으로 잘못 저장한 DB를 2025년으로 자동 보정."""
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT row_hash, source_file FROM sample_returns").fetchall()
+        updates = []
+        for row_hash, source_file in rows:
+            fixed_date = infer_2025_date_from_no_year_filename(source_file)
+            if fixed_date:
+                updates.append((fixed_date, row_hash))
+        if updates:
+            conn.executemany("UPDATE sample_returns SET return_date = ? WHERE row_hash = ?", updates)
+            conn.commit()
+
+
+def cleanup_duplicate_rows():
+    """날짜 보정 후 같은 데이터가 중복 등록되어 있으면 1건만 남깁니다."""
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            DELETE FROM sample_returns
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM sample_returns
+                GROUP BY return_date, vendor, address, content, source_file
+            )
+            """
+        )
+        conn.commit()
+
+
 def seed_default_data_if_needed():
     """data 폴더의 기본 엑셀을 DB에 누적 등록. 중복은 row_hash로 자동 제외."""
     init_db()
@@ -425,8 +472,11 @@ def filter_df(df, search_mode, start_date=None, end_date=None, single_date=None,
     return filtered, None
 
 
-# 앱 시작 시 기본 데이터 DB 등록
+# 앱 시작 시 기본 데이터 DB 등록 및 기존 오인식 날짜 자동 보정
+migrate_no_year_files_to_2025()
 seed_default_data_if_needed()
+migrate_no_year_files_to_2025()
+cleanup_duplicate_rows()
 
 if "uploader_nonce" not in st.session_state:
     st.session_state.uploader_nonce = 0
