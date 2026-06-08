@@ -1,11 +1,13 @@
 import hashlib
 import io
+import json
 import os
 import re
 import sqlite3
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -13,11 +15,12 @@ import streamlit as st
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 except Exception:
     service_account = None
     build = None
     MediaIoBaseDownload = None
+    MediaIoBaseUpload = None
 
 st.set_page_config(page_title="미샵 샘플 반품 관리 프로그램", layout="wide")
 
@@ -40,149 +43,13 @@ st.markdown(
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"                         # 최초 기본 엑셀 파일
-UPLOAD_DIR = APP_DIR / "persistent_uploads"         # 업로드 원본 보관
-DB_PATH = APP_DIR / "sample_returns.db"              # 누적 DB
-UPLOAD_DIR.mkdir(exist_ok=True)
+CACHE_DIR = APP_DIR / "gdrive_cache"                 # 구글드라이브에서 내려받은 임시 캐시
+DB_PATH = APP_DIR / "sample_returns.db"              # 검색용 SQLite DB
 DATA_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
 
 COLUMNS = ["반납일", "업체명", "주소", "엑셀 기입 내용", "원본파일"]
-
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-DRIVE_SUPPORTED_MIMES = {
-    "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/zip",
-    "application/x-zip-compressed",
-    "application/vnd.google-apps.spreadsheet",
-}
-
-
-def get_secret_value(path, default=""):
-    """Streamlit secrets에서 안전하게 값을 가져옵니다."""
-    try:
-        cur = st.secrets
-        for key in path:
-            cur = cur[key]
-        return cur
-    except Exception:
-        return default
-
-
-def get_drive_folder_id() -> str:
-    return str(get_secret_value(["gdrive", "folder_id"], "")).strip()
-
-
-def get_service_account_info():
-    raw_json = get_secret_value(["gdrive", "service_account_json"], "")
-    if raw_json:
-        import json
-        if isinstance(raw_json, str):
-            return json.loads(raw_json)
-        return dict(raw_json)
-    # 대안: [gdrive_service_account] 형태의 TOML 섹션 지원
-    info = get_secret_value(["gdrive_service_account"], {})
-    if info:
-        return dict(info)
-    return None
-
-
-def is_drive_configured() -> bool:
-    return bool(get_drive_folder_id() and get_service_account_info() and service_account and build)
-
-
-def get_drive_service():
-    if not service_account or not build:
-        raise RuntimeError("Google API 라이브러리가 설치되지 않았습니다. requirements.txt를 확인해주세요.")
-    info = get_service_account_info()
-    if not info:
-        raise RuntimeError("Streamlit Secrets에 서비스계정 JSON이 없습니다.")
-    creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-
-def list_drive_files_recursive(service, folder_id: str) -> list[dict]:
-    """지정 폴더와 하위 폴더의 엑셀/ZIP/구글시트 파일 목록을 가져옵니다."""
-    found = []
-    queue = [folder_id]
-    while queue:
-        current = queue.pop(0)
-        page_token = None
-        while True:
-            resp = service.files().list(
-                q=f"'{current}' in parents and trashed = false",
-                spaces="drive",
-                fields="nextPageToken, files(id, name, mimeType, modifiedTime, size, md5Checksum)",
-                pageToken=page_token,
-                pageSize=1000,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute()
-            for item in resp.get("files", []):
-                mime = item.get("mimeType", "")
-                name = item.get("name", "")
-                if mime == "application/vnd.google-apps.folder":
-                    queue.append(item["id"])
-                elif name.lower().endswith((".xls", ".xlsx", ".zip")) or mime in DRIVE_SUPPORTED_MIMES:
-                    found.append(item)
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-    return found
-
-
-def download_drive_file(service, file_meta: dict) -> tuple[bytes, str]:
-    """Drive 파일을 bytes로 다운로드. Google Sheets는 xlsx로 export합니다."""
-    file_id = file_meta["id"]
-    name = file_meta.get("name", "drive_file")
-    mime = file_meta.get("mimeType", "")
-    if mime == "application/vnd.google-apps.spreadsheet":
-        request = service.files().export_media(
-            fileId=file_id,
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        if not name.lower().endswith(".xlsx"):
-            name = f"{name}.xlsx"
-    else:
-        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return fh.getvalue(), name
-
-
-def sync_google_drive_to_db() -> tuple[int, int, int, int, str]:
-    """구글드라이브 폴더 파일을 다운로드해 DB에 누적 저장합니다.
-    반환: 파일수, 다운로드수, 파싱행수, 신규등록행수, 메시지
-    """
-    folder_id = get_drive_folder_id()
-    if not folder_id:
-        return 0, 0, 0, 0, "Google Drive folder_id가 설정되지 않았습니다."
-    service = get_drive_service()
-    files = list_drive_files_recursive(service, folder_id)
-    downloaded = parsed_rows = inserted_rows = 0
-    for meta in files:
-        data, filename = download_drive_file(service, meta)
-        digest = file_digest(data)
-        safe_name = safe_filename(filename)
-        stem, ext = os.path.splitext(safe_name)
-        if not ext and meta.get("mimeType") == "application/vnd.google-apps.spreadsheet":
-            ext = ".xlsx"
-        target = UPLOAD_DIR / f"gdrive_{stem}_{digest[:10]}{ext}"
-        if not target.exists():
-            target.write_bytes(data)
-        downloaded += 1
-        if ext.lower() == ".zip" or filename.lower().endswith(".zip"):
-            df, _ = parse_zip_bytes(data, filename)
-        else:
-            df = parse_excel_bytes(data, filename)
-        parsed_rows += len(df)
-        inserted = insert_dataframe_to_db(df, digest)
-        inserted_rows += inserted
-        record_imported_file(digest, filename, str(target.relative_to(APP_DIR)), len(df))
-    return len(files), downloaded, parsed_rows, inserted_rows, "동기화 완료"
-
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def normalize_text(value) -> str:
@@ -193,7 +60,6 @@ def normalize_text(value) -> str:
 
 
 def compact_text(value) -> str:
-    """검색 안정화를 위해 공백을 제거한 비교용 텍스트."""
     return re.sub(r"\s+", "", normalize_text(value)).lower()
 
 
@@ -240,7 +106,6 @@ def extract_date(raw: pd.DataFrame, source_name: str):
                 pass
 
     # 3) 03-05.xls / 05-12.xls처럼 파일명에 연도가 없는 기존 자료는 2025년 데이터로 고정 처리
-    #    형준님 기준: 연도 없는 샘플반납 파일은 2025년 자료입니다.
     m2 = re.search(r"(?<!\d)(\d{1,2})[-./](\d{1,2})(?!\d)", base)
     if m2:
         mth, d = map(int, m2.groups())
@@ -380,7 +245,7 @@ def make_row_hash(row) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
-def insert_dataframe_to_db(df: pd.DataFrame, source_file_hash: str = "") -> int:
+def insert_dataframe_to_db(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
     rows = []
@@ -435,9 +300,7 @@ def get_file_already_imported(file_hash: str) -> bool:
 
 
 def infer_2025_date_from_no_year_filename(filename: str):
-    """기존 파일명(예: 05-12.xls, 12-08..xls, 01-09-standalone.xls)에 연도가 없으면 2025년으로 보정."""
     base = os.path.basename(filename or "")
-    # 2026-03-05.xls 처럼 연도가 명시된 파일은 건드리지 않음
     if re.search(r"20\d{2}", base):
         return None
     m = re.search(r"(?<!\d)(\d{1,2})[-./](\d{1,2})(?!\d)", base)
@@ -451,7 +314,6 @@ def infer_2025_date_from_no_year_filename(filename: str):
 
 
 def migrate_no_year_files_to_2025():
-    """이전 버전에서 연도 없는 파일을 2026년으로 잘못 저장한 DB를 2025년으로 자동 보정."""
     init_db()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("SELECT row_hash, source_file FROM sample_returns").fetchall()
@@ -466,7 +328,6 @@ def migrate_no_year_files_to_2025():
 
 
 def cleanup_duplicate_rows():
-    """날짜 보정 후 같은 데이터가 중복 등록되어 있으면 1건만 남깁니다."""
     init_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -489,44 +350,167 @@ def seed_default_data_if_needed():
         if path.name.startswith("~$") or path.suffix.lower() not in [".xls", ".xlsx", ".zip"]:
             continue
         data = path.read_bytes()
-        digest = file_digest(data)
+        digest = "local_" + file_digest(data)
         if get_file_already_imported(digest):
             continue
         if path.suffix.lower() == ".zip":
             df, _ = parse_zip_bytes(data, path.name)
         else:
             df = parse_excel_bytes(data, path.name)
-        inserted = insert_dataframe_to_db(df, digest)
+        insert_dataframe_to_db(df)
         record_imported_file(digest, path.name, f"data/{path.name}", len(df))
 
 
-def save_and_import_upload(uploaded_files) -> tuple[int, int, int]:
-    """업로드 파일 저장 + DB 누적. 반환: 저장파일 수, 전체 파싱행, 신규등록행."""
-    saved_count = 0
+def get_drive_folder_id() -> str:
+    return str(st.secrets.get("GDRIVE_FOLDER_ID", "")).strip()
+
+
+def get_service_account_info() -> Optional[dict]:
+    # 방법 1: [gcp_service_account] 형태의 secrets
+    if "gcp_service_account" in st.secrets:
+        return dict(st.secrets["gcp_service_account"])
+    # 방법 2: gcp_service_account_json = '''{...}''' 형태의 secrets
+    raw = st.secrets.get("gcp_service_account_json", "")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_drive_service():
+    if service_account is None or build is None:
+        raise RuntimeError("Google Drive 연동 패키지가 설치되지 않았습니다. requirements.txt를 확인해주세요.")
+    info = get_service_account_info()
+    if not info:
+        raise RuntimeError("Streamlit Secrets에 Google 서비스 계정 정보가 없습니다.")
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def list_drive_files(folder_id: str) -> list[dict]:
+    service = get_drive_service()
+    query = (
+        f"'{folder_id}' in parents and trashed = false and "
+        "(mimeType = 'application/vnd.ms-excel' or "
+        "mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or "
+        "mimeType = 'application/zip' or "
+        "name contains '.xls' or name contains '.xlsx' or name contains '.zip')"
+    )
+    files = []
+    token = None
+    while True:
+        res = service.files().list(
+            q=query,
+            spaces="drive",
+            fields="nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime, size)",
+            pageToken=token,
+            pageSize=1000,
+        ).execute()
+        files.extend(res.get("files", []))
+        token = res.get("nextPageToken")
+        if not token:
+            break
+    return sorted(files, key=lambda x: x.get("name", ""))
+
+
+def download_drive_file(file_id: str) -> bytes:
+    service = get_drive_service()
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return fh.getvalue()
+
+
+def upload_file_to_drive(folder_id: str, filename: str, file_bytes: bytes, mime_type: str = "application/octet-stream") -> dict:
+    service = get_drive_service()
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+    metadata = {"name": safe_filename(filename), "parents": [folder_id]}
+    return service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, name, mimeType, md5Checksum, modifiedTime, size",
+    ).execute()
+
+
+def parse_file_bytes_by_name(data: bytes, filename: str) -> pd.DataFrame:
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        df, _ = parse_zip_bytes(data, filename)
+        return df
+    if lower.endswith((".xls", ".xlsx")):
+        return parse_excel_bytes(data, filename)
+    return pd.DataFrame(columns=COLUMNS)
+
+
+def drive_file_import_key(file_meta: dict, file_bytes: bytes) -> str:
+    # Drive md5Checksum이 없는 경우가 있어 파일 id + modifiedTime + bytes md5를 함께 사용
+    md5 = file_meta.get("md5Checksum") or file_digest(file_bytes)
+    return f"gdrive_{file_meta.get('id','')}_{md5}_{file_meta.get('modifiedTime','')}"
+
+
+def sync_google_drive(folder_id: str) -> tuple[int, int, int, int]:
+    """구글드라이브 폴더 파일을 DB에 누적. 반환: 파일수, 신규파일수, 파싱행, 신규등록행."""
+    files = list_drive_files(folder_id)
+    new_files = 0
     parsed_rows = 0
     inserted_rows = 0
+    for meta in files:
+        name = meta.get("name", "")
+        if not name.lower().endswith((".zip", ".xls", ".xlsx")):
+            continue
+        # 1차 key: id + md5/modifiedTime로 이미 처리한 파일은 다운로드 생략 가능
+        quick_key = f"gdrive_{meta.get('id','')}_{meta.get('md5Checksum','')}_{meta.get('modifiedTime','')}"
+        if get_file_already_imported(quick_key):
+            continue
+        data = download_drive_file(meta["id"])
+        final_key = drive_file_import_key(meta, data)
+        if get_file_already_imported(final_key):
+            # quick_key도 등록해서 다음 동기화 때 다운로드 생략
+            record_imported_file(quick_key, name, f"GoogleDrive/{name}", 0)
+            continue
+        safe_name = safe_filename(name)
+        cache_path = CACHE_DIR / f"{meta['id']}_{safe_name}"
+        if not cache_path.exists():
+            cache_path.write_bytes(data)
+        df = parse_file_bytes_by_name(data, name)
+        parsed_rows += len(df)
+        inserted = insert_dataframe_to_db(df)
+        inserted_rows += inserted
+        record_imported_file(final_key, name, f"GoogleDrive/{name}", len(df))
+        record_imported_file(quick_key, name, f"GoogleDrive/{name}", len(df))
+        new_files += 1
+    return len(files), new_files, parsed_rows, inserted_rows
+
+
+def upload_files_to_drive_and_import(uploaded_files, folder_id: str) -> tuple[int, int, int]:
+    uploaded_count = 0
+    parsed_rows = 0
+    inserted_rows = 0
+    mime_map = {
+        ".xls": "application/vnd.ms-excel",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".zip": "application/zip",
+    }
     for up in uploaded_files or []:
         if not up.name.lower().endswith((".zip", ".xls", ".xlsx")):
             continue
         data = up.getvalue()
-        digest = file_digest(data)
-        name = safe_filename(up.name)
-        stem, ext = os.path.splitext(name)
-        target = UPLOAD_DIR / f"{stem}_{digest[:10]}{ext}"
-        if not target.exists():
-            target.write_bytes(data)
-        saved_count += 1
-
-        # 이미 같은 파일을 가져온 적이 있더라도, 혹시 이전 import 실패가 있었을 수 있으므로 파싱은 수행하고 row_hash로 중복 제거
-        if ext.lower() == ".zip":
-            df, _ = parse_zip_bytes(data, up.name)
-        else:
-            df = parse_excel_bytes(data, up.name)
+        ext = os.path.splitext(up.name)[1].lower()
+        meta = upload_file_to_drive(folder_id, up.name, data, mime_map.get(ext, "application/octet-stream"))
+        df = parse_file_bytes_by_name(data, up.name)
         parsed_rows += len(df)
-        inserted = insert_dataframe_to_db(df, digest)
+        inserted = insert_dataframe_to_db(df)
         inserted_rows += inserted
-        record_imported_file(digest, up.name, str(target.relative_to(APP_DIR)), len(df))
-    return saved_count, parsed_rows, inserted_rows
+        key = drive_file_import_key(meta, data)
+        record_imported_file(key, up.name, f"GoogleDrive/{meta.get('name', up.name)}", len(df))
+        uploaded_count += 1
+    return uploaded_count, parsed_rows, inserted_rows
 
 
 @st.cache_data(show_spinner=False)
@@ -630,46 +614,56 @@ if "search_triggered" not in st.session_state:
     st.session_state.search_triggered = False
 if "upload_msg" not in st.session_state:
     st.session_state.upload_msg = ""
+if "sync_msg" not in st.session_state:
+    st.session_state.sync_msg = ""
 
 st.title("미샵 샘플 반품 관리 프로그램")
-st.caption("구글드라이브 폴더의 엑셀/ZIP 파일을 동기화해 DB에 누적 저장하고 검색합니다.")
+st.caption("구글드라이브 폴더에 반납 엑셀을 보관하고, 프로그램은 동기화 후 DB 기준으로 검색합니다.")
 
+folder_id = get_drive_folder_id()
+gdrive_ready = bool(folder_id and get_service_account_info())
 
-st.markdown("### 구글드라이브 동기화")
-if is_drive_configured():
-    c1, c2 = st.columns([0.8, 2.2])
-    with c1:
-        sync_clicked = st.button("구글드라이브 동기화", use_container_width=True)
-    with c2:
-        st.caption("구글드라이브 지정 폴더에 올린 엑셀/ZIP 파일을 읽어 DB에 누적 저장합니다.")
-    if sync_clicked:
-        with st.spinner("구글드라이브 파일을 동기화하는 중입니다..."):
-            try:
-                total_files, downloaded, parsed_rows, inserted_rows, msg = sync_google_drive_to_db()
-                st.cache_data.clear()
-                st.success(f"{msg}: Drive 파일 {total_files:,}개 확인 / 다운로드 {downloaded:,}개 / 파싱 {parsed_rows:,}건 / 신규 DB 등록 {inserted_rows:,}건")
-            except Exception as e:
-                st.error(f"구글드라이브 동기화 실패: {e}")
-else:
-    st.info("Google Drive 연동 설정 전입니다. Streamlit Secrets에 folder_id와 서비스계정 JSON을 넣으면 동기화 버튼이 활성화됩니다.")
+if not gdrive_ready:
+    st.warning("Google Drive 연동 설정이 아직 완료되지 않았습니다. Streamlit Secrets에 서비스 계정 정보와 GDRIVE_FOLDER_ID를 입력해주세요.")
 
-st.divider()
+sync_col1, sync_col2 = st.columns([1.1, 4])
+with sync_col1:
+    sync_clicked = st.button("구글드라이브 동기화", use_container_width=True, disabled=not gdrive_ready)
+with sync_col2:
+    st.caption("직원이 구글드라이브 '샘플관리파일' 폴더에 엑셀/ZIP을 넣은 뒤 이 버튼을 누르면 신규 파일만 DB에 반영됩니다.")
+
+if sync_clicked:
+    try:
+        total_files, new_files, parsed_rows, inserted_rows = sync_google_drive(folder_id)
+        st.session_state.sync_msg = f"구글드라이브 동기화 완료: 폴더 파일 {total_files:,}개 / 신규 처리 {new_files:,}개 / 파싱 {parsed_rows:,}건 / 신규 DB 등록 {inserted_rows:,}건"
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"구글드라이브 동기화 실패: {e}")
+
+if st.session_state.sync_msg:
+    st.success(st.session_state.sync_msg)
+    st.session_state.sync_msg = ""
 
 uploaded_files = st.file_uploader(
-    "직접 업로드 백업용 (ZIP / XLS / XLSX)",
+    "프로그램에서 바로 업로드하기 (ZIP / XLS / XLSX) - 업로드 파일은 구글드라이브에도 저장됩니다",
     type=["zip", "xls", "xlsx"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state.uploader_nonce}",
-    help="구글드라이브 동기화가 기본 운영 방식입니다. 급할 때는 여기서 직접 업로드해도 DB에 누적됩니다.",
+    help="가장 권장되는 방식은 구글드라이브 폴더에 직접 파일을 넣고 동기화하는 것입니다. 이 업로드창을 쓰면 파일을 구글드라이브 폴더에 올린 뒤 DB에도 즉시 반영합니다.",
+    disabled=not gdrive_ready,
 )
 
 if uploaded_files:
-    saved_count, parsed_rows, inserted_rows = save_and_import_upload(uploaded_files)
-    st.session_state.uploader_nonce += 1
-    st.session_state.search_triggered = False
-    st.session_state.upload_msg = f"업로드 {saved_count}개 완료 / 파싱 {parsed_rows:,}건 / 신규 DB 등록 {inserted_rows:,}건"
-    st.cache_data.clear()
-    st.rerun()
+    try:
+        uploaded_count, parsed_rows, inserted_rows = upload_files_to_drive_and_import(uploaded_files, folder_id)
+        st.session_state.uploader_nonce += 1
+        st.session_state.search_triggered = False
+        st.session_state.upload_msg = f"업로드 {uploaded_count}개 완료 / 구글드라이브 저장 완료 / 파싱 {parsed_rows:,}건 / 신규 DB 등록 {inserted_rows:,}건"
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"업로드 실패: {e}")
 
 if st.session_state.upload_msg:
     st.success(st.session_state.upload_msg)
@@ -741,19 +735,19 @@ else:
     st.caption("검색 조건을 입력한 뒤 검색 버튼을 눌러주세요.")
 
 with st.expander("프로그램 안내 / 등록 현황"):
-    st.write("- 기본 운영: 구글드라이브 지정 폴더에 엑셀/ZIP 파일을 올린 뒤 `구글드라이브 동기화` 버튼을 누릅니다.")
-    st.write("- 직접 업로드한 파일과 구글드라이브에서 내려받은 파일은 `persistent_uploads` 폴더에 원본 저장됩니다.")
-    st.write("- 검색 데이터는 `sample_returns.db` SQLite DB에 누적 저장됩니다.")
-    st.write("- 새로고침하거나 프로그램을 다시 실행해도 DB 파일이 남아 있으면 검색 데이터가 유지됩니다.")
-    st.write("- 업체명만 입력해도 검색되고, 상품명/내용만 입력해도 검색됩니다.")
+    st.write("- 직원은 구글드라이브 `샘플관리파일` 폴더에 엑셀/ZIP 파일을 넣으면 됩니다.")
+    st.write("- 프로그램에서 `구글드라이브 동기화` 버튼을 누르면 신규 파일만 DB에 누적 저장됩니다.")
+    st.write("- 프로그램 화면의 업로드창을 이용해도 파일은 구글드라이브 폴더에 저장되고 DB에도 반영됩니다.")
+    st.write("- 검색은 엑셀 원본이 아니라 `sample_returns.db` 검색용 DB 기준으로 실행됩니다.")
+    st.write("- Streamlit 서버가 초기화되어 DB가 사라져도 구글드라이브 폴더 원본을 다시 동기화하면 복구됩니다.")
     st.write(f"- 기간 검색 기본값은 {default_label}으로 자동 설정됩니다.")
     if not all_df.empty:
         st.write(f"- 등록 데이터 기간: {all_df['반납일'].min().strftime('%Y-%m-%d')} ~ {all_df['반납일'].max().strftime('%Y-%m-%d')}")
     st.write(f"- 현재 DB 등록 건수: {len(all_df):,}건")
     st.write(f"- 현재 등록 파일 수: {len(files_info):,}개")
-    st.write(f"- DB 파일 위치: `{DB_PATH.name}`")
-    st.warning("Streamlit Cloud 저장공간이 초기화되더라도 구글드라이브 폴더에 원본 파일이 남아 있으면 `구글드라이브 동기화`로 DB를 다시 복구할 수 있습니다.")
+    if folder_id:
+        st.write(f"- Google Drive Folder ID: `{folder_id}`")
     if not files_info.empty:
-        st.dataframe(files_info.head(30), use_container_width=True, hide_index=True)
+        st.dataframe(files_info.head(50), use_container_width=True, hide_index=True)
 
 st.markdown("<div style='margin-top:24px; color:#666; font-size:12px;'>copyright made by MISHARP COMPANY. MIYAWA. 2026</div>", unsafe_allow_html=True)
