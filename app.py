@@ -10,6 +10,15 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+except Exception:
+    service_account = None
+    build = None
+    MediaIoBaseDownload = None
+
 st.set_page_config(page_title="미샵 샘플 반품 관리 프로그램", layout="wide")
 
 st.markdown(
@@ -37,6 +46,143 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
 COLUMNS = ["반납일", "업체명", "주소", "엑셀 기입 내용", "원본파일"]
+
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+DRIVE_SUPPORTED_MIMES = {
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/vnd.google-apps.spreadsheet",
+}
+
+
+def get_secret_value(path, default=""):
+    """Streamlit secrets에서 안전하게 값을 가져옵니다."""
+    try:
+        cur = st.secrets
+        for key in path:
+            cur = cur[key]
+        return cur
+    except Exception:
+        return default
+
+
+def get_drive_folder_id() -> str:
+    return str(get_secret_value(["gdrive", "folder_id"], "")).strip()
+
+
+def get_service_account_info():
+    raw_json = get_secret_value(["gdrive", "service_account_json"], "")
+    if raw_json:
+        import json
+        if isinstance(raw_json, str):
+            return json.loads(raw_json)
+        return dict(raw_json)
+    # 대안: [gdrive_service_account] 형태의 TOML 섹션 지원
+    info = get_secret_value(["gdrive_service_account"], {})
+    if info:
+        return dict(info)
+    return None
+
+
+def is_drive_configured() -> bool:
+    return bool(get_drive_folder_id() and get_service_account_info() and service_account and build)
+
+
+def get_drive_service():
+    if not service_account or not build:
+        raise RuntimeError("Google API 라이브러리가 설치되지 않았습니다. requirements.txt를 확인해주세요.")
+    info = get_service_account_info()
+    if not info:
+        raise RuntimeError("Streamlit Secrets에 서비스계정 JSON이 없습니다.")
+    creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def list_drive_files_recursive(service, folder_id: str) -> list[dict]:
+    """지정 폴더와 하위 폴더의 엑셀/ZIP/구글시트 파일 목록을 가져옵니다."""
+    found = []
+    queue = [folder_id]
+    while queue:
+        current = queue.pop(0)
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=f"'{current}' in parents and trashed = false",
+                spaces="drive",
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime, size, md5Checksum)",
+                pageToken=page_token,
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            for item in resp.get("files", []):
+                mime = item.get("mimeType", "")
+                name = item.get("name", "")
+                if mime == "application/vnd.google-apps.folder":
+                    queue.append(item["id"])
+                elif name.lower().endswith((".xls", ".xlsx", ".zip")) or mime in DRIVE_SUPPORTED_MIMES:
+                    found.append(item)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    return found
+
+
+def download_drive_file(service, file_meta: dict) -> tuple[bytes, str]:
+    """Drive 파일을 bytes로 다운로드. Google Sheets는 xlsx로 export합니다."""
+    file_id = file_meta["id"]
+    name = file_meta.get("name", "drive_file")
+    mime = file_meta.get("mimeType", "")
+    if mime == "application/vnd.google-apps.spreadsheet":
+        request = service.files().export_media(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        if not name.lower().endswith(".xlsx"):
+            name = f"{name}.xlsx"
+    else:
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return fh.getvalue(), name
+
+
+def sync_google_drive_to_db() -> tuple[int, int, int, int, str]:
+    """구글드라이브 폴더 파일을 다운로드해 DB에 누적 저장합니다.
+    반환: 파일수, 다운로드수, 파싱행수, 신규등록행수, 메시지
+    """
+    folder_id = get_drive_folder_id()
+    if not folder_id:
+        return 0, 0, 0, 0, "Google Drive folder_id가 설정되지 않았습니다."
+    service = get_drive_service()
+    files = list_drive_files_recursive(service, folder_id)
+    downloaded = parsed_rows = inserted_rows = 0
+    for meta in files:
+        data, filename = download_drive_file(service, meta)
+        digest = file_digest(data)
+        safe_name = safe_filename(filename)
+        stem, ext = os.path.splitext(safe_name)
+        if not ext and meta.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+            ext = ".xlsx"
+        target = UPLOAD_DIR / f"gdrive_{stem}_{digest[:10]}{ext}"
+        if not target.exists():
+            target.write_bytes(data)
+        downloaded += 1
+        if ext.lower() == ".zip" or filename.lower().endswith(".zip"):
+            df, _ = parse_zip_bytes(data, filename)
+        else:
+            df = parse_excel_bytes(data, filename)
+        parsed_rows += len(df)
+        inserted = insert_dataframe_to_db(df, digest)
+        inserted_rows += inserted
+        record_imported_file(digest, filename, str(target.relative_to(APP_DIR)), len(df))
+    return len(files), downloaded, parsed_rows, inserted_rows, "동기화 완료"
+
 
 
 def normalize_text(value) -> str:
@@ -486,14 +632,35 @@ if "upload_msg" not in st.session_state:
     st.session_state.upload_msg = ""
 
 st.title("미샵 샘플 반품 관리 프로그램")
-st.caption("엑셀/ZIP 파일을 업로드하면 DB에 누적 저장되고, 새로고침 후에도 검색됩니다.")
+st.caption("구글드라이브 폴더의 엑셀/ZIP 파일을 동기화해 DB에 누적 저장하고 검색합니다.")
+
+
+st.markdown("### 구글드라이브 동기화")
+if is_drive_configured():
+    c1, c2 = st.columns([0.8, 2.2])
+    with c1:
+        sync_clicked = st.button("구글드라이브 동기화", use_container_width=True)
+    with c2:
+        st.caption("구글드라이브 지정 폴더에 올린 엑셀/ZIP 파일을 읽어 DB에 누적 저장합니다.")
+    if sync_clicked:
+        with st.spinner("구글드라이브 파일을 동기화하는 중입니다..."):
+            try:
+                total_files, downloaded, parsed_rows, inserted_rows, msg = sync_google_drive_to_db()
+                st.cache_data.clear()
+                st.success(f"{msg}: Drive 파일 {total_files:,}개 확인 / 다운로드 {downloaded:,}개 / 파싱 {parsed_rows:,}건 / 신규 DB 등록 {inserted_rows:,}건")
+            except Exception as e:
+                st.error(f"구글드라이브 동기화 실패: {e}")
+else:
+    st.info("Google Drive 연동 설정 전입니다. Streamlit Secrets에 folder_id와 서비스계정 JSON을 넣으면 동기화 버튼이 활성화됩니다.")
+
+st.divider()
 
 uploaded_files = st.file_uploader(
-    "샘플반납 엑셀 파일 업로드 (ZIP / XLS / XLSX)",
+    "직접 업로드 백업용 (ZIP / XLS / XLSX)",
     type=["zip", "xls", "xlsx"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state.uploader_nonce}",
-    help="업로드한 파일은 persistent_uploads 폴더에 보관되고, 내용은 sample_returns.db에 누적 저장됩니다.",
+    help="구글드라이브 동기화가 기본 운영 방식입니다. 급할 때는 여기서 직접 업로드해도 DB에 누적됩니다.",
 )
 
 if uploaded_files:
@@ -574,7 +741,8 @@ else:
     st.caption("검색 조건을 입력한 뒤 검색 버튼을 눌러주세요.")
 
 with st.expander("프로그램 안내 / 등록 현황"):
-    st.write("- 업로드한 파일은 `persistent_uploads` 폴더에 원본 저장됩니다.")
+    st.write("- 기본 운영: 구글드라이브 지정 폴더에 엑셀/ZIP 파일을 올린 뒤 `구글드라이브 동기화` 버튼을 누릅니다.")
+    st.write("- 직접 업로드한 파일과 구글드라이브에서 내려받은 파일은 `persistent_uploads` 폴더에 원본 저장됩니다.")
     st.write("- 검색 데이터는 `sample_returns.db` SQLite DB에 누적 저장됩니다.")
     st.write("- 새로고침하거나 프로그램을 다시 실행해도 DB 파일이 남아 있으면 검색 데이터가 유지됩니다.")
     st.write("- 업체명만 입력해도 검색되고, 상품명/내용만 입력해도 검색됩니다.")
@@ -584,7 +752,7 @@ with st.expander("프로그램 안내 / 등록 현황"):
     st.write(f"- 현재 DB 등록 건수: {len(all_df):,}건")
     st.write(f"- 현재 등록 파일 수: {len(files_info):,}개")
     st.write(f"- DB 파일 위치: `{DB_PATH.name}`")
-    st.warning("Streamlit Cloud에서 앱을 재배포하거나 서버 저장공간이 초기화되면 로컬 DB 파일이 사라질 수 있습니다. 완전 운영형은 Supabase/Google Sheets 같은 외부 DB 연결이 필요합니다.")
+    st.warning("Streamlit Cloud 저장공간이 초기화되더라도 구글드라이브 폴더에 원본 파일이 남아 있으면 `구글드라이브 동기화`로 DB를 다시 복구할 수 있습니다.")
     if not files_info.empty:
         st.dataframe(files_info.head(30), use_container_width=True, hide_index=True)
 
