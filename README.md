@@ -1,24 +1,49 @@
-# sample-manager
+# MISHARP Sample Manager (Google Drive 원본 기반)
 
-미샵 샘플 반품 관리 프로그램입니다.
+## 직원이 매일 사용하는 방법
 
-## 운영 방식
+1. 평소 사용하던 Google Drive `샘플관리파일` 폴더에 반납 내역 **.xls / .xlsx / .zip** 파일을 올립니다.
+2. <https://sample-manager.streamlit.app/> 접속 후 **업체명**, **상품명**, **반납기간**을 입력합니다.
+3. **검색**을 누르면 Google Drive 동기화가 선행되고 검색이 실행됩니다. 별도로 `GitHub data/`를 수정할 필요가 없습니다.
+4. 동기화 상태가 정상일 때 검색 결과에 나오면 등록된 반품 기록입니다. 검색이 안 될 때는 기간을 `전체`로 전환해 확인해 보세요.
 
-1. Google Drive에 샘플반납 엑셀/ZIP 파일을 업로드합니다.
-2. Streamlit 앱에서 `구글드라이브 동기화` 버튼을 누릅니다.
-3. 프로그램이 파일을 읽어 `sample_returns.db`에 검색용 데이터로 누적 저장합니다.
-4. 검색은 DB 기준으로 실행됩니다.
+## 처음 설치 / 기존 레포 덮어쓰기
 
-## Streamlit Secrets
+1. 기존 GitHub `sample-manager` 레포를 ZIP으로 백업합니다.
+2. 이 패키지 내부의 `app.py`, `sample_core.py`, `requirements.txt`, `data/`, `.gitignore` 등 **파일과 폴더 내용**을 레포 루트에 덮어씁니다. 상위 `sample-manager` 폴더 자체를 다시 중첩시키지 마세요.
+3. Streamlit Community Cloud에 배포된 앱의 `Main file path`가 `app.py`인지 확인합니다.
+4. Streamlit Cloud → App settings → Secrets에 기존 `GDRIVE_FOLDER_ID`와 `gcp_service_account_json`을 유지합니다. 값 이름이 `DRIVE_FOLDER_ID`였다면 그것도 인식하지만 `GDRIVE_FOLDER_ID`가 권장됩니다.
+5. 새로 배포된 앱을 열면 기본자료를 적재한 뒤 Google Drive의 원본 파일을 자동 동기화합니다. 필요하면 `구글드라이브 새로 동기화` 버튼을 누릅니다.
 
-Streamlit Cloud → App → Settings → Secrets에 아래 형식으로 입력합니다.
+## Google Drive 권한
 
-```toml
-[gdrive]
-folder_id = "구글드라이브_폴더_ID"
-service_account_json = """
-서비스계정_JSON_전체내용
-"""
-```
+- 지정 폴더를 서비스 계정 이메일에 **뷰어** 권한 이상으로 공유해야 읽을 수 있습니다.
+- **개인 `내 드라이브` 폴더에서는 서비스 계정이 파일의 소유자가 될 수 없어 API 직접 업로드가 실패**할 수 있습니다. 따라서 직원은 Drive 웹 화면에서 직접 파일을 올려주세요. 앱에서는 검색/읽기만 수행합니다.
+- 폴더 및 **하위 폴더**의 Office Excel, ZIP, Google Sheets(변환된 문서)를 지원합니다.
+- 폴더 설정값은 `샘플관리파일` 폴더를 열었을 때 URL의 `/folders/` 뒤 ID입니다.
 
-서비스계정 이메일을 Google Drive 폴더에 `뷰어` 또는 `편집자` 권한으로 공유해야 합니다.
+## 데이터 원칙과 주의
+
+- Drive에 있는 원본 파일이 유일한 지속 저장소입니다. Streamlit에서 사용하는 `.cache/sample_search.sqlite3`는 **서버 재시작 시 초기화될 수 있는 검색 인덱스**입니다. 재시작 시 Drive를 다시 읽어 재구성합니다.
+- GitHub `data/` 안에 제공되어 있던 초기 Excel도 함께 읽습니다. 중복된 반품 기록은 검색 표시 시 통합될 수 있습니다.
+- **기본날짜**: 이번 달 자료가 있으면 이번 달, 없으면 등록된 최신 월을 표시합니다.
+- **연도 없는 파일 이름** `03-05.xls` → `2025-03-05`; **명시 연도** `2026-03-05.xls` → `2026-03-05`.
+- CSV 추출, 처리자, 완료 버튼, 로그 기능은 없습니다. Excel 자체가 **반품 완료 목록**입니다.
+- 문제가 있는 Excel 파일은 자동으로 무시하지 않고 하단 `문제 파일` 목록에 표시합니다. 정상 추출되지 않은 파일은 완료 처리되지 않아 다음 동기화에서도 재시도됩니다.
+- 처음 전체 동기화는 Drive 파일 수에 따라 오래 걸릴 수 있습니다. 그 후에는 **변경된 파일만** 다시 내려받습니다(동일 서버 유지 중).
+- 앱이 다시 시작되면 SQLite 인덱스는 재생성될 수 있으므로 실제 영구 보관되는 것은 Drive의 원본입니다.
+
+## 보안
+
+- Google Cloud JSON 서비스 계정 개인키를 GitHub 레포나 본 ZIP에 올리지 마세요.
+- 전에 채팅이나 파일로 전송했던 서비스 계정 키는 운영 안정화 뒤 새 키로 교체하고 기존 키를 폐기하는 것을 권장합니다.
+- `.streamlit/secrets.toml.example`은 키 없는 예시 형식일 뿐입니다.
+
+## 변경 사항
+
+- 앱 첫 접속 + 매 검색 때 Drive 동기화
+- Google Sheets / 하위 폴더 / ZIP 내부 XLS 검색
+- 파일 변환 및 파싱 실패 정보 표시, 실패 파일 재시도
+- Drive 파일 수정 시 레코드 단위로 교체 후 검색
+- 원본 파일명 날짜 우선, 연도 없는 파일은 2025년
+- 날짜 + 업체명 + 상품명 검색 조건 AND 적용, 전체 기간 검색 제공
